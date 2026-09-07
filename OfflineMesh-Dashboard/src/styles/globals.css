@@ -1,0 +1,101 @@
+/* ─── Reset & base ─────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  /* Brand */
+  --red:      #ef4444;
+  --orange:   #f97316;
+  --yellow:   #eab308;
+  --green:    #22c55e;
+  --blue:     #3b82f6;
+  --purple:   #a855f7;
+
+  /* Surface */
+  --bg-base:    #050b14;
+  --bg-surface: #0d1623;
+  --bg-card:    #111c2d;
+  --bg-hover:   #162236;
+  --border:     #1e3048;
+  --border-dim: #162035;
+
+  /* Text */
+  --text-primary:   #e8f0fe;
+  --text-secondary: #7da3cc;
+  --text-muted:     #3d5a7a;
+
+  /* Misc */
+  --radius:  10px;
+  --radius-lg: 14px;
+  --shadow:  0 2px 16px rgba(0,0,0,0.5);
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font-family: inherit; cursor: pointer; border: none; background: none; }
+a      { color: inherit; text-decoration: none; }
+ul, ol { list-style: none; }
+
+/* ─── Scrollbar ────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar              { width: 6px; height: 6px; }
+::-webkit-scrollbar-track        { background: var(--bg-surface); }
+::-webkit-scrollbar-thumb        { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover  { background: var(--text-muted); }
+
+/* ─── Layout helpers ───────────────────────────────────────────────────────── */
+.flex        { display: flex; }
+.flex-col    { flex-direction: column; }
+.items-center{ align-items: center; }
+.justify-between{ justify-content: space-between; }
+.gap-2  { gap: 8px; }
+.gap-3  { gap: 12px; }
+.gap-4  { gap: 16px; }
+.flex-1 { flex: 1; }
+.w-full { width: 100%; }
+
+/* ─── Demo data badge ──────────────────────────────────────────────────────── */
+.demo-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: rgba(234,179,8,0.12);
+  border: 1px solid rgba(234,179,8,0.3);
+  border-radius: 4px;
+  color: #eab308;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+/* ─── Status dot ───────────────────────────────────────────────────────────── */
+.status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot.online  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.status-dot.offline { background: var(--red);   box-shadow: 0 0 6px var(--red);   }
+.status-dot.warning { background: var(--yellow); }
+
+/* ─── Pulse animation ──────────────────────────────────────────────────────── */
+@keyframes pulse {
+  0%,100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+.pulse { animation: pulse 2s ease-in-out infinite; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeIn 0.25s ease; }
