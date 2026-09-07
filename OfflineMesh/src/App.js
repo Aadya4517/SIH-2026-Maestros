@@ -1,13 +1,26 @@
 /**
  * App.js
- * Root component with a 4-tab bottom navigator:
- *   🚨 Authority  — SenderScreen      (send alerts)
- *   📡 Receiver   — ReceiverScreen    (display incoming alerts)
- *   📊 Analytics  — AnalyticsDashboard (delivery metrics)
- *   🕸️ Network    — NetworkVisualization (mesh diagram)
+ *
+ * The root of the OfflineMesh citizen app.
+ *
+ * CITIZEN UI — intentionally simple:
+ *   📡 Receiver  — see incoming disaster alerts
+ *   🚨 Send Alert — send a disaster alert to nearby phones
+ *
+ * That's it. No analytics. No network diagrams. No government login.
+ * The complexity lives in the separate Emergency Command Center (web dashboard).
+ *
+ * Why only two tabs?
+ * During a disaster, citizens need to do one thing fast. Every extra
+ * tab adds cognitive load. Two large targets = better usability under stress.
+ *
+ * The Analytics and Network screens (AnalyticsDashboard.js,
+ * NetworkVisualization.js) still exist in src/screens/ and all their
+ * logic is preserved — they've just been moved out of the citizen navigation.
+ * That functionality lives in the laptop Emergency Command Center instead.
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import {
   SafeAreaView,
   StyleSheet,
@@ -15,25 +28,17 @@ import {
   Text,
   View,
   StatusBar,
-  ScrollView,
 } from 'react-native';
 
 import { MessageProvider } from './context/MessageContext';
-import SenderScreen          from './screens/SenderScreen';
-import ReceiverScreen        from './screens/ReceiverScreen';
-import AnalyticsDashboard    from './screens/AnalyticsDashboard';
-import NetworkVisualization  from './screens/NetworkVisualization';
+import SenderScreen   from './screens/SenderScreen';
+import ReceiverScreen from './screens/ReceiverScreen';
 
-// ─── Tab definitions ──────────────────────────────────────────────────────────
-
+// Two tabs — the full extent of the citizen interface
 const TABS = [
-  { key: 'receiver',  icon: '📡', label: 'Receiver'  },
-  { key: 'sender',    icon: '🚨', label: 'Authority' },
-  { key: 'analytics', icon: '📊', label: 'Analytics' },
-  { key: 'network',   icon: '🕸️', label: 'Network'   },
+  { key: 'receiver', icon: '📡', label: 'Receive' },
+  { key: 'sender',   icon: '🚨', label: 'Send Alert' },
 ];
-
-// ─── Tab bar ──────────────────────────────────────────────────────────────────
 
 function TabBar({ activeTab, onTabChange }) {
   return (
@@ -59,36 +64,22 @@ function TabBar({ activeTab, onTabChange }) {
   );
 }
 
-// ─── Root ─────────────────────────────────────────────────────────────────────
-
-function App() {
-  const [activeTab, setActiveTab] = React.useState('receiver');
-
-  function renderScreen() {
-    switch (activeTab) {
-      case 'sender':    return <SenderScreen />;
-      case 'analytics': return <AnalyticsDashboard />;
-      case 'network':   return <NetworkVisualization />;
-      default:          return <ReceiverScreen />;
-    }
-  }
+export default function App() {
+  // Receiver is the default tab — citizens should see incoming alerts first
+  const [activeTab, setActiveTab] = useState('receiver');
 
   return (
     <MessageProvider>
       <StatusBar backgroundColor="#0d0d1a" barStyle="light-content" />
       <SafeAreaView style={styles.root}>
         <View style={styles.content}>
-          {renderScreen()}
+          {activeTab === 'sender' ? <SenderScreen /> : <ReceiverScreen />}
         </View>
         <TabBar activeTab={activeTab} onTabChange={setActiveTab} />
       </SafeAreaView>
     </MessageProvider>
   );
 }
-
-export default App;
-
-// ─── Styles ───────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
   root: {
@@ -103,29 +94,29 @@ const styles = StyleSheet.create({
     backgroundColor: '#0d0d1a',
     borderTopWidth: 1,
     borderTopColor: '#1e1e3a',
-    height: 60,
-    paddingBottom: 4,
+    height: 62,
+    paddingBottom: 6,
   },
   tab: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    opacity: 0.45,
+    opacity: 0.4,
     paddingTop: 6,
-    gap: 2,
+    gap: 3,
   },
   tabActive: {
     opacity: 1,
-    borderTopWidth: 2,
+    borderTopWidth: 3,
     borderTopColor: '#e74c3c',
   },
   tabIcon: {
-    fontSize: 18,
+    fontSize: 22,
   },
   tabLabel: {
-    fontSize: 10,
+    fontSize: 11,
     color: '#aaaacc',
-    fontWeight: '600',
+    fontWeight: '700',
     letterSpacing: 0.5,
   },
   tabLabelActive: {
