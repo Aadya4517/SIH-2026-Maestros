@@ -1,0 +1,12 @@
+# Throwaway scaffolding — not part of the project
+TempRN/
+
+# Editor settings — personal, not shared
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Dependency folders (each sub-project has its own .gitignore)
+node_modules/
