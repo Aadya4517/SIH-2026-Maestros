@@ -1,13 +1,23 @@
 /**
  * ReceiverScreen.js
- * User phone UI.
  *
- * Shows a full-screen alert overlay styled to the incoming alert type.
- * Each of the 4 types (FLOOD, LANDSLIDE, AVALANCHE, EARTHQUAKE) has its
- * own background colour, icon, and action text.
+ * The citizen's screen. Simple, readable, actionable.
+ *
+ * When an alert arrives:
+ *   1. Full-screen overlay appears, coloured per disaster type
+ *   2. Phone vibrates urgently
+ *   3. User sees: disaster type, action instruction, timestamp, latency
+ *   4. Two action buttons:
+ *        [ I ACKNOWLEDGE ]  — confirms receipt, sends confirmation back
+ *        [ 🆘 SOS ]         — sends GPS location + distress signal to authority
+ *   5. After acknowledging, alert dismisses and appears in history
+ *
+ * When idle:
+ *   - Shows BLE peer count and listening status
+ *   - Alert history list (type, time)
  */
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -18,52 +28,96 @@ import {
   Vibration,
   ScrollView,
   ActivityIndicator,
+  Platform,
+  PermissionsAndroid,
 } from 'react-native';
 import { useMessage } from '../context/MessageContext';
 import { ALERT_TYPES } from '../services/MessageService';
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function formatTime(ms) {
-  const d = new Date(ms);
+  const d  = new Date(ms);
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   return `${hh}:${mm}:${ss}`;
 }
 
-// Vibration pattern: 3 long bursts
-const VIBRATION_PATTERN = [0, 500, 200, 500, 200, 1000];
+// Vibration pattern — 3 urgent bursts, increasing length
+const ALERT_VIBRATION = [0, 400, 150, 600, 150, 1000];
+const SOS_VIBRATION   = [0, 300, 100, 300, 100, 300, 100, 900]; // SOS pattern
 
-// Border colour per type for history items
-const HISTORY_BORDER = {
-  FLOOD:      '#FF0000',
-  LANDSLIDE:  '#FF8C00',
-  AVALANCHE:  '#c8a800',
-  EARTHQUAKE: '#8B008B',
-};
+// ─── GPS helper ───────────────────────────────────────────────────────────────
+
+/**
+ * getGpsLocation
+ *
+ * Attempts to get the device's current GPS coordinates.
+ * Returns { lat, lng } or null if unavailable or denied.
+ *
+ * Uses the built-in Geolocation API from React Native core.
+ * For higher accuracy, swap with react-native-geolocation-service
+ * and update the import accordingly.
+ */
+async function getGpsLocation() {
+  // Request location permission on Android
+  if (Platform.OS === 'android') {
+    try {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        {
+          title:   'Location Permission',
+          message: 'OfflineMesh needs your location for SOS alerts.',
+          buttonPositive: 'Allow',
+        },
+      );
+      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+        console.warn('[ReceiverScreen] Location permission denied');
+        return null;
+      }
+    } catch (e) {
+      console.warn('[ReceiverScreen] Location permission error:', e.message);
+      return null;
+    }
+  }
+
+  return new Promise((resolve) => {
+    const { Geolocation } = require('react-native');
+    // Fall back to the global if the module isn't separately installed
+    const geo = Geolocation || global.navigator?.geolocation;
+    if (!geo) { resolve(null); return; }
+
+    geo.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+      (err) => {
+        console.warn('[ReceiverScreen] GPS error:', err.message);
+        resolve(null);
+      },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 30000 },
+    );
+  });
+}
 
 // ─── Alert Overlay ────────────────────────────────────────────────────────────
 
-function AlertOverlay({ alert, onDismiss }) {
+function AlertOverlay({ alert, onAcknowledge, onSOS, sosState }) {
   const fadeAnim  = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.8)).current;
-
-  // Resolve type definition — fall back to FLOOD if unknown
-  const def = ALERT_TYPES[alert.type] || ALERT_TYPES.FLOOD;
+  const def       = ALERT_TYPES[alert.type] || ALERT_TYPES.FLOOD;
+  const latencyMs = alert.receivedAt - alert.timestamp;
 
   useEffect(() => {
+    // Animate in
     Animated.parallel([
       Animated.timing(fadeAnim,  { toValue: 1, duration: 300, useNativeDriver: true }),
       Animated.spring(scaleAnim, { toValue: 1, friction: 5,   useNativeDriver: true }),
     ]).start();
 
-    Vibration.vibrate(VIBRATION_PATTERN);
-
+    // Urgent vibration
+    Vibration.vibrate(ALERT_VIBRATION);
     return () => Vibration.cancel();
   }, [fadeAnim, scaleAnim]);
-
-  const latencyMs = alert.receivedAt - alert.timestamp;
 
   return (
     <Animated.View
@@ -74,15 +128,16 @@ function AlertOverlay({ alert, onDismiss }) {
       <StatusBar backgroundColor={def.darkColor} barStyle="light-content" />
 
       <Animated.View style={[styles.alertContent, { transform: [{ scale: scaleAnim }] }]}>
-        {/* Icon */}
+
+        {/* Disaster icon */}
         <Text style={styles.alertIcon}>{def.icon}</Text>
 
-        {/* Alert type badge */}
+        {/* Type badge */}
         <View style={[styles.typeBadge, { borderColor: def.color }]}>
           <Text style={[styles.typeBadgeText, { color: def.color }]}>{def.label}</Text>
         </View>
 
-        {/* Main text */}
+        {/* Main message */}
         <Text style={styles.alertTitle}>{def.message}</Text>
         <Text style={[styles.alertSubtitle, { color: def.color }]}>{def.subtitle}</Text>
 
@@ -95,16 +150,42 @@ function AlertOverlay({ alert, onDismiss }) {
           {latencyMs > 0 && (
             <Text style={styles.alertMetaText}>Latency: {latencyMs} ms</Text>
           )}
+          {alert.channel && (
+            <Text style={styles.alertMetaText}>
+              Via: {alert.channel === 'push' ? '🌐 PUSH' : '📡 BLE'}
+            </Text>
+          )}
         </View>
 
-        {/* Dismiss */}
+        {/* ── I ACKNOWLEDGE button ── */}
         <TouchableOpacity
-          style={[styles.dismissButton, { borderColor: def.color }]}
-          onPress={onDismiss}
+          style={[styles.acknowledgeButton, { backgroundColor: def.color }]}
+          onPress={onAcknowledge}
           accessibilityRole="button"
-          accessibilityLabel="Acknowledge and dismiss alert">
-          <Text style={styles.dismissText}>ACKNOWLEDGE</Text>
+          accessibilityLabel="I acknowledge this alert">
+          <Text style={styles.acknowledgeText}>✓  I ACKNOWLEDGE</Text>
         </TouchableOpacity>
+
+        {/* ── SOS button ── */}
+        <TouchableOpacity
+          style={[
+            styles.sosButton,
+            sosState === 'sending' && styles.sosButtonSending,
+            sosState === 'sent'    && styles.sosButtonSent,
+          ]}
+          onPress={onSOS}
+          disabled={sosState === 'sending' || sosState === 'sent'}
+          accessibilityRole="button"
+          accessibilityLabel="Send SOS with my location">
+          {sosState === 'sending' ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : sosState === 'sent' ? (
+            <Text style={styles.sosText}>✓ SOS Sent</Text>
+          ) : (
+            <Text style={styles.sosText}>🆘  SOS — Send My Location</Text>
+          )}
+        </TouchableOpacity>
+
       </Animated.View>
     </Animated.View>
   );
@@ -114,11 +195,23 @@ function AlertOverlay({ alert, onDismiss }) {
 
 function HistoryItem({ alert }) {
   const def = ALERT_TYPES[alert.type] || ALERT_TYPES.FLOOD;
+  const borderColor = {
+    FLOOD:      '#FF0000',
+    LANDSLIDE:  '#FF8C00',
+    AVALANCHE:  '#c8a800',
+    EARTHQUAKE: '#8B008B',
+  }[def.key] || '#e74c3c';
+
   return (
-    <View style={[styles.historyItem, { borderLeftColor: HISTORY_BORDER[def.key] || '#e74c3c' }]}>
+    <View style={[styles.historyItem, { borderLeftColor: borderColor }]}>
       <View style={styles.historyLeft}>
         <Text style={styles.historyIcon}>{def.icon}</Text>
-        <Text style={styles.historyMessage}>{def.message}</Text>
+        <View>
+          <Text style={styles.historyMessage}>{def.message}</Text>
+          {alert.acknowledged && (
+            <Text style={styles.historyAcked}>✓ Acknowledged</Text>
+          )}
+        </View>
       </View>
       <Text style={styles.historyTime}>{formatTime(alert.receivedAt)}</Text>
     </View>
@@ -135,8 +228,42 @@ export default function ReceiverScreen() {
     isBleReady,
     bleError,
     dismissAlert,
+    acknowledgeAlert,
+    sendSOS,
   } = useMessage();
 
+  // SOS state per alert: null | 'sending' | 'sent' | 'failed'
+  const [sosState, setSosState] = useState(null);
+
+  // Reset SOS state whenever the alert changes
+  useEffect(() => {
+    setSosState(null);
+  }, [currentAlert?.message_id]);
+
+  // ── Acknowledge handler ─────────────────────────────────────────────────
+  const handleAcknowledge = () => {
+    if (acknowledgeAlert) acknowledgeAlert(currentAlert);
+    dismissAlert();
+  };
+
+  // ── SOS handler ─────────────────────────────────────────────────────────
+  const handleSOS = async () => {
+    setSosState('sending');
+    Vibration.vibrate(SOS_VIBRATION);
+
+    try {
+      const location = await getGpsLocation();
+      if (sendSOS) {
+        await sendSOS({ alert: currentAlert, location });
+      }
+      setSosState('sent');
+    } catch (e) {
+      console.error('[ReceiverScreen] SOS failed:', e.message);
+      setSosState('failed');
+    }
+  };
+
+  // ── Status bar ───────────────────────────────────────────────────────────
   const statusColor = isBleReady ? '#27ae60' : bleError ? '#e74c3c' : '#f39c12';
   const statusText  = bleError
     ? `BLE Error: ${bleError}`
@@ -191,9 +318,14 @@ export default function ReceiverScreen() {
         </ScrollView>
       )}
 
-      {/* ── Full-screen alert overlay ── */}
+      {/* ── Full-screen overlay ── */}
       {currentAlert && (
-        <AlertOverlay alert={currentAlert} onDismiss={dismissAlert} />
+        <AlertOverlay
+          alert={currentAlert}
+          onAcknowledge={handleAcknowledge}
+          onSOS={handleSOS}
+          sosState={sosState}
+        />
       )}
     </View>
   );
@@ -290,7 +422,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#ecf0f1',
     fontWeight: '700',
-    flex: 1,
+  },
+  historyAcked: {
+    fontSize: 11,
+    color: '#27ae60',
+    marginTop: 2,
   },
   historyTime: {
     fontSize: 13,
@@ -307,11 +443,12 @@ const styles = StyleSheet.create({
   },
   alertContent: {
     alignItems: 'center',
-    paddingHorizontal: 30,
-    gap: 14,
+    paddingHorizontal: 28,
+    gap: 12,
+    width: '100%',
   },
   alertIcon: {
-    fontSize: 80,
+    fontSize: 72,
   },
   typeBadge: {
     borderWidth: 2,
@@ -325,14 +462,14 @@ const styles = StyleSheet.create({
     letterSpacing: 3,
   },
   alertTitle: {
-    fontSize: 40,
+    fontSize: 36,
     fontWeight: '900',
     color: '#ffffff',
     letterSpacing: 2,
     textAlign: 'center',
   },
   alertSubtitle: {
-    fontSize: 22,
+    fontSize: 20,
     fontWeight: '800',
     letterSpacing: 1,
     textAlign: 'center',
@@ -342,27 +479,58 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.35)',
     borderRadius: 10,
     paddingHorizontal: 24,
-    paddingVertical: 14,
-    gap: 6,
-    marginTop: 6,
+    paddingVertical: 12,
+    gap: 4,
+    marginTop: 4,
+    width: '100%',
   },
   alertMetaText: {
-    fontSize: 16,
+    fontSize: 14,
     color: '#f8f8f8',
     fontWeight: '600',
   },
-  dismissButton: {
-    marginTop: 20,
-    backgroundColor: 'rgba(255,255,255,0.12)',
+
+  // ── Acknowledge button ──
+  acknowledgeButton: {
     borderRadius: 30,
-    paddingHorizontal: 40,
-    paddingVertical: 14,
-    borderWidth: 2,
+    paddingHorizontal: 32,
+    paddingVertical: 16,
+    marginTop: 8,
+    width: '100%',
+    alignItems: 'center',
+    elevation: 4,
   },
-  dismissText: {
-    fontSize: 17,
+  acknowledgeText: {
+    fontSize: 18,
+    fontWeight: '900',
+    color: '#ffffff',
+    letterSpacing: 1,
+  },
+
+  // ── SOS button ──
+  sosButton: {
+    borderRadius: 30,
+    paddingHorizontal: 32,
+    paddingVertical: 14,
+    width: '100%',
+    alignItems: 'center',
+    backgroundColor: '#7f0000',
+    borderWidth: 2,
+    borderColor: '#ef4444',
+    elevation: 4,
+  },
+  sosButtonSending: {
+    backgroundColor: '#5a0000',
+    opacity: 0.8,
+  },
+  sosButtonSent: {
+    backgroundColor: '#166534',
+    borderColor: '#22c55e',
+  },
+  sosText: {
+    fontSize: 16,
     fontWeight: '800',
     color: '#ffffff',
-    letterSpacing: 2,
+    letterSpacing: 0.5,
   },
 });

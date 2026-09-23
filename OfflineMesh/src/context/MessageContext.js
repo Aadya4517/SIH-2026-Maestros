@@ -4,20 +4,20 @@
  * The central nervous system of the OfflineMesh app. Every screen gets
  * its data and actions from here via the useMessage() hook.
  *
- * On startup it runs the full BLE initialisation sequence:
+ * What changed in this version:
+ *   - sendAlert() now routes through HybridAlertService (PUSH + BLE auto)
+ *   - acknowledgeAlert() sends a confirmation message back via BLE
+ *   - sendSOS() broadcasts a GPS+distress message via BLE
+ *   - Alert repeats are managed via HybridAlertService.scheduleRepeats()
+ *   - lastSendStatus shows the routing result on SenderScreen
+ *   - confirmations[] tracks who has acknowledged on the authority phone
+ *
+ * BLE init sequence (unchanged — do not modify):
  *   1. Request Android permissions
- *   2. Wait for Bluetooth adapter to be on
- *   3. Start the PERIPHERAL — this phone starts advertising and opens
- *      its GATT server so other phones can discover and write to it
- *   4. Start SCANNING — discover nearby phones and connect to them
- *   5. Listen for incoming messages from both the peripheral (native events)
- *      and the central (ble-plx monitor)
- *
- * On shutdown it stops everything cleanly so the next app launch is fresh.
- *
- * FUTURE INTEGRATION:
- *   When the OfflineMesh gateway backend exists, replace the BLE calls
- *   here with WebSocket subscriptions. The state shape stays the same.
+ *   2. Wait for Bluetooth adapter
+ *   3. Start peripheral (GATT server + advertising)
+ *   4. Scan for peers
+ *   5. Listen for messages (peripheral + central paths)
  */
 
 import React, {
@@ -33,7 +33,6 @@ import {
   requestAndroidPermissions,
   waitForBluetooth,
   startPeripheral,
-  stopPeripheral,
   scanForDevices,
   broadcastAlert,
   listenForMessages,
@@ -47,72 +46,70 @@ import {
   handleIncomingMessage,
 } from '../services/MessageService';
 
+import {
+  sendAlertAutomatic,
+  scheduleRepeats,
+  cancelAllRepeats,
+} from '../services/HybridAlertService';
+
+import {
+  publishDashboardState,
+} from '../services/DashboardBridgeService';
+
 const MessageContext = createContext(null);
 
 export function MessageProvider({ children }) {
-  // ─── State ──────────────────────────────────────────────────────────────────
 
-  // The alert currently being shown as a full-screen overlay (null = no overlay)
+  // ─── Core alert state ─────────────────────────────────────────────────────
   const [currentAlert,        setCurrentAlert]        = useState(null);
-  // All alerts received this session — shown in the history list
   const [alertHistory,        setAlertHistory]        = useState([]);
-  // How many other OfflineMesh phones we're connected to right now
   const [peerCount,           setPeerCount]           = useState(0);
-  // Becomes true once BLE is fully set up and ready to send/receive
   const [isBleReady,          setIsBleReady]          = useState(false);
-  // Human-readable error if something goes wrong during setup
   const [bleError,            setBleError]            = useState(null);
-  // Alerts this device has sent (shown on SenderScreen history)
   const [sentAlerts,          setSentAlerts]          = useState([]);
-  // Delivery stats for the most recent send (count, ms, per-phone breakdown)
   const [deliveryStats,       setDeliveryStats]       = useState(null);
-  // List of peer devices — populated as phones connect (used by NetworkViz in dashboard)
   const [connectedDevices,    setConnectedDevices]    = useState([]);
-  // IDs of peers that received the last alert — used for glow effects
   const [lastAlertRecipients, setLastAlertRecipients] = useState(new Set());
 
-  // A ref to the incoming alert handler so we can update it without
-  // removing and re-adding the BLE event listener on every render
+  // ─── New state for hybrid features ───────────────────────────────────────
+  // Status text from the last send (e.g. "✅ Sent via PUSH + BLE")
+  const [lastSendStatus,   setLastSendStatus]   = useState(null);
+  // Map of message_id → { phoneId, time, label } for acknowledgements
+  const [confirmations,    setConfirmations]    = useState({});
+  // List of SOS events received on the authority phone
+  const [sosEvents,        setSosEvents]        = useState([]);
+
   const onNewAlertRef = useRef(null);
 
-  // ─── BLE initialisation ──────────────────────────────────────────────────────
+  // ─── BLE initialisation ──────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
 
     async function initBle() {
       try {
-        // ── Step 1: Permissions ────────────────────────────────────────────────
-        // Android requires explicit permission grants before any BLE use.
+        // Step 1: Android permissions
         const granted = await requestAndroidPermissions();
         if (!granted) {
-          setBleError('Bluetooth permissions denied. Please go to Settings → Apps → OfflineMesh → Permissions and enable Bluetooth.');
+          setBleError('Bluetooth permissions denied. Go to Settings → Apps → OfflineMesh → Permissions.');
           return;
         }
         if (cancelled) return;
 
-        // ── Step 2: Adapter ready ─────────────────────────────────────────────
-        // We can't scan or advertise until the Bluetooth adapter is powered on.
+        // Step 2: Wait for Bluetooth adapter
         await waitForBluetooth();
         if (cancelled) return;
 
-        // ── Step 3: Start peripheral (advertising + GATT server) ──────────────
-        // This is what makes THIS phone visible to other OfflineMesh phones.
-        // The native Kotlin module opens the GATT server and starts advertising.
-        // The callback here is called when another phone writes a message to us.
-        startPeripheral((incomingMessage) => {
-          // Peripheral received a write — route it through the alert handler
-          if (onNewAlertRef.current) {
-            onNewAlertRef.current(incomingMessage);
-          }
-        });
+        // Step 3: Start GATT server + advertising
+        // This phone is now discoverable by other OfflineMesh phones.
+        const peripheralStarted = await startPeripheral();
+        if (!peripheralStarted) {
+          setBleError('BLE peripheral could not start. Restart Bluetooth and reopen the app.');
+          return;
+        }
         if (cancelled) return;
 
-        // ── Step 4: Start scanning for other phones ────────────────────────────
-        // We look for phones advertising our SERVICE_UUID and connect to them.
-        // Once connected, we can write alerts to their characteristics.
+        // Step 4: Scan for peers
         await scanForDevices((deviceId, deviceName) => {
-          console.log('[Context] Peer connected:', deviceId);
-          // Track connected devices for the network visualization
           setConnectedDevices(prev => {
             if (prev.find(d => d.id === deviceId)) return prev;
             return [
@@ -128,28 +125,24 @@ export function MessageProvider({ children }) {
         });
         if (cancelled) return;
 
-        // ── Step 5: Track peer count changes ───────────────────────────────────
+        // Step 5: Keep peer count in sync
         onPeerListChanged(count => {
-          if (!cancelled) {
-            setPeerCount(count);
-            setConnectedDevices(prev =>
-              prev.map((d, idx) => ({ ...d, connected: idx < count })),
-            );
-          }
+          if (cancelled) return;
+          setPeerCount(count);
+          setConnectedDevices(prev =>
+            prev.map((d, idx) => ({ ...d, connected: idx < count })),
+          );
+          _publishNetworkState(count);
         });
 
-        // ── Step 6: Listen for central-side messages (ble-plx monitor) ─────────
-        // This catches writes from phones using the central write path.
-        // Peripheral writes (via native GATT server) are handled in step 3.
-        listenForMessages((incomingMessage) => {
-          if (onNewAlertRef.current) {
-            onNewAlertRef.current(incomingMessage);
-          }
+        // Step 6: Listen for incoming messages (central path via ble-plx)
+        listenForMessages(message => {
+          if (onNewAlertRef.current) onNewAlertRef.current(message);
         });
 
         if (!cancelled) {
           setIsBleReady(true);
-          console.log('[Context] ✓ BLE ready — peripheral advertising, scanning for peers');
+          console.log('[Context] ✓ BLE ready — peripheral advertising, scanning active');
         }
 
       } catch (e) {
@@ -162,82 +155,262 @@ export function MessageProvider({ children }) {
 
     return () => {
       cancelled = true;
-      console.log('[Context] App closing — shutting down BLE');
-      stopPeripheral(); // stop advertising and close GATT server
-      destroyBleManager(); // stop scan, disconnect peers, destroy manager
+      console.log('[Context] App closing — shutting down BLE and repeats');
+      cancelAllRepeats();
+      destroyBleManager();
     };
   }, []);
 
-  // ─── Alert handler (kept in ref so BLE listener never needs re-registering) ──
+  // ─── Incoming message router ──────────────────────────────────────────────
+  // Using a ref so we never need to re-register the BLE listener.
   useEffect(() => {
     onNewAlertRef.current = async (rawMessage) => {
+
+      // ── Handle acknowledgement messages ─────────────────────────────────
+      if (rawMessage?.type === 'ACK') {
+        setConfirmations(prev => ({
+          ...prev,
+          [rawMessage.ack_for]: {
+            phoneId: rawMessage.sender_id,
+            label:   rawMessage.senderLabel || rawMessage.sender_id,
+            time:    rawMessage.timestamp,
+          },
+        }));
+        return; // don't display ACK as an alert
+      }
+
+      // ── Handle SOS messages ──────────────────────────────────────────────
+      if (rawMessage?.type === 'SOS') {
+        setSosEvents(prev => [{
+          sender_id:  rawMessage.sender_id,
+          lat:        rawMessage.lat,
+          lng:        rawMessage.lng,
+          timestamp:  rawMessage.timestamp,
+          message_id: rawMessage.message_id,
+        }, ...prev]);
+        return; // don't display SOS as a regular alert
+      }
+
+      // ── Handle regular alerts ────────────────────────────────────────────
       await handleIncomingMessage(rawMessage, (message) => {
-        const received = { ...message, receivedAt: Date.now() };
+        const received = {
+          ...message,
+          receivedAt: Date.now(),
+          // Mark which channel delivered it (push arrives via FCM, ble via this path)
+          channel: 'ble',
+        };
         setCurrentAlert(received);
         setAlertHistory(prev => [received, ...prev]);
+
+        // Forward telemetry to dashboard bridge (fire-and-forget)
+        _publishReceivedAlert(received).catch(() => {});
       });
     };
   }, []);
 
-  // ─── Safety-net peer count poll ───────────────────────────────────────────────
-  // The event callback should keep peerCount accurate, but we poll every 2s
-  // as a fallback in case a connection event is missed.
+  // ─── Safety-net peer count poll ───────────────────────────────────────────
   useEffect(() => {
     const interval = setInterval(() => setPeerCount(getPeerCount()), 2000);
     return () => clearInterval(interval);
   }, []);
 
-  // ─── sendAlert ────────────────────────────────────────────────────────────────
+  // ─── sendAlert ────────────────────────────────────────────────────────────
   /**
-   * Called by SenderScreen when the user taps the send button.
-   * Creates the message, broadcasts it, then records delivery stats.
+   * Called by SenderScreen when the user taps SEND ALERT.
    *
-   * @param {string} type  'FLOOD' | 'LANDSLIDE' | 'AVALANCHE' | 'EARTHQUAKE'
+   * @param {string} type      'FLOOD' | 'LANDSLIDE' | 'AVALANCHE' | 'EARTHQUAKE'
+   * @param {string} severity  'ONE_TIME' | 'MODERATE' | 'CRITICAL'
    */
-  const sendAlert = useCallback(async (type = 'FLOOD') => {
+  const sendAlert = useCallback(async (type = 'FLOOD', severity = 'ONE_TIME') => {
     const message = createMessage(type);
-    const sentAt  = Date.now();
+    // Attach severity so history items can show the repeat badge
+    message.severity = severity;
 
-    // Record in sent history immediately — don't wait for delivery confirmation
+    const sentAt = Date.now();
     setSentAlerts(prev => [{ ...message, sentAt }, ...prev]);
 
-    const results = await broadcastAlert(message);
-    const elapsed = Date.now() - sentAt;
+    // ── Smart routing (PUSH if online, BLE always) ─────────────────────────
+    const { statusText, bleResults, isOnline, anySuccess } =
+      await sendAlertAutomatic(message);
 
-    const successCount = Object.values(results).filter(Boolean).length;
+    setLastSendStatus(statusText);
 
-    // Build per-phone records — useful for the dashboard analytics
-    // Note: RSSI is NOT available from GATT writes, so we don't fake it here
-    const perPhone = Object.entries(results).map(([phone_id, received], idx) => ({
+    const elapsed      = Date.now() - sentAt;
+    const successCount = Object.values(bleResults).filter(Boolean).length;
+
+    // Build per-phone delivery records (authority-side only, no fake RSSI)
+    const perPhone = Object.entries(bleResults).map(([phone_id, received], idx) => ({
       phone_id,
       label:             `Phone ${idx + 2}`,
       received,
       delivery_time_ms:  received ? elapsed : null,
       sent_timestamp:    sentAt,
       received_timestamp: received ? sentAt + elapsed : null,
-      // We intentionally omit RSSI — we don't have real values here
+      // RSSI intentionally omitted — not available from GATT writes
     }));
 
-    setDeliveryStats({
-      count:    successCount,
-      ms:       elapsed,
-      total:    peerCount,
-      type,
-      perPhone,
-    });
+    setDeliveryStats({ count: successCount, ms: elapsed, total: peerCount, type, perPhone });
 
-    // Record which device IDs received this alert (for network viz highlight)
     setLastAlertRecipients(new Set(
-      Object.entries(results).filter(([, ok]) => ok).map(([id]) => id),
+      Object.entries(bleResults).filter(([, ok]) => ok).map(([id]) => id),
     ));
 
-    return { message, results, elapsed };
+    // ── Schedule repeats for MODERATE / CRITICAL ───────────────────────────
+    scheduleRepeats(
+      message.message_id,
+      message,
+      severity,
+      (repeatNum, result) => {
+        // Update status text on each repeat
+        setLastSendStatus(`🔄 Repeat ${repeatNum}: ${result.statusText}`);
+      },
+    );
+
+    // ── Dashboard telemetry ────────────────────────────────────────────────
+    _publishSendTelemetry(message, perPhone, successCount, elapsed, peerCount)
+      .catch(() => {});
+
+    return { message, bleResults, elapsed, anySuccess };
   }, [peerCount]);
 
-  // ─── Dismiss the full-screen alert overlay ────────────────────────────────────
+  // ─── acknowledgeAlert ─────────────────────────────────────────────────────
+  /**
+   * Called when the receiver taps "I ACKNOWLEDGE".
+   * Sends an ACK message back over BLE so the authority phone knows.
+   *
+   * @param {object} alert  the alert being acknowledged
+   */
+  const acknowledgeAlert = useCallback(async (alert) => {
+    if (!alert) return;
+
+    const ackMessage = {
+      message_id: `ack-${Date.now()}`,
+      type:       'ACK',
+      ack_for:    alert.message_id,  // which alert this confirms
+      sender_id:  'local',           // replaced by DEVICE_ID in production
+      timestamp:  Date.now(),
+      ttl:        1,                 // ACK only needs 1 hop back to authority
+    };
+
+    try {
+      await broadcastAlert(ackMessage);
+      console.log('[Context] ✓ ACK sent for', alert.message_id);
+    } catch (e) {
+      console.warn('[Context] ACK send failed:', e.message);
+    }
+
+    // Mark as acknowledged in local history
+    setAlertHistory(prev =>
+      prev.map(a =>
+        a.message_id === alert.message_id ? { ...a, acknowledged: true } : a,
+      ),
+    );
+  }, []);
+
+  // ─── sendSOS ──────────────────────────────────────────────────────────────
+  /**
+   * Called when the receiver taps the SOS button.
+   * Broadcasts a distress message with GPS coordinates over BLE.
+   *
+   * @param {object} param0  { alert, location: { lat, lng } | null }
+   */
+  const sendSOS = useCallback(async ({ alert, location }) => {
+    const sosMessage = {
+      message_id: `sos-${Date.now()}`,
+      type:       'SOS',
+      sender_id:  'local',
+      lat:        location?.lat ?? null,
+      lng:        location?.lng ?? null,
+      ack_for:    alert?.message_id ?? null,
+      timestamp:  Date.now(),
+      ttl:        3,  // enough hops to reach authority through relay
+    };
+
+    try {
+      await broadcastAlert(sosMessage);
+      console.log('[Context] ✓ SOS sent', location ? `@ ${location.lat},${location.lng}` : '(no GPS)');
+    } catch (e) {
+      console.warn('[Context] SOS send failed:', e.message);
+      throw e; // propagate so ReceiverScreen can show 'failed' state
+    }
+  }, []);
+
+  // ─── dismissAlert ────────────────────────────────────────────────────────
   const dismissAlert = useCallback(() => setCurrentAlert(null), []);
 
-  // ─── Provide to child components ─────────────────────────────────────────────
+  // ─── Dashboard bridge helpers (fire-and-forget) ────────────────────────
+  function _publishNetworkState(count) {
+    try {
+      publishDashboardState({
+        source: 'authority',
+        updatedAt: new Date().toISOString(),
+        networkStatus: {
+          online: true,
+          connectedDevices: count + 1,
+          totalDevices:     count + 1,
+          activeAlerts:     0,
+          lastSync:         new Date().toISOString(),
+          activeConnections: count,
+          alertsRelayed:    0,
+          healthStatus:     count > 0 ? 'HEALTHY' : 'CRITICAL',
+        },
+      });
+    } catch (_) {}
+  }
+
+  async function _publishReceivedAlert(received) {
+    await publishDashboardState({
+      source: 'peer',
+      updatedAt: new Date().toISOString(),
+      latestReceivedAlert: received,
+    });
+  }
+
+  async function _publishSendTelemetry(message, perPhone, successCount, elapsed, peers) {
+    await publishDashboardState({
+      source: 'authority',
+      updatedAt: new Date().toISOString(),
+      networkStatus: {
+        online: true,
+        connectedDevices: peers + 1,
+        totalDevices:     peers + 1,
+        activeAlerts:     1,
+        lastSync:         new Date().toISOString(),
+        activeConnections: peers,
+        alertsRelayed:    0,
+        healthStatus:     peers > 0 ? 'HEALTHY' : 'CRITICAL',
+      },
+      latestAlert: {
+        id:               message.message_id,
+        type:             message.type,
+        severity:         'HIGH',
+        area:             'OfflineMesh live network',
+        timestamp:        new Date(message.timestamp).toISOString(),
+        originDevice:     'gateway-local',
+        devicesReached:   successCount,
+        totalDevices:     peers + 1,
+        status:           'ACTIVE',
+        avgDeliveryMs:    elapsed,
+        unreachableDevices: perPhone.filter(p => !p.received).map(p => p.phone_id),
+      },
+      deliveryMetrics: {
+        totalReached:       successCount,
+        totalDevices:       peers,
+        successRate:        peers > 0 ? Math.round((successCount / peers) * 100) : 0,
+        avgDeliveryMs:      elapsed,
+        unreachable:        peers - successCount,
+        latestAlertReached: successCount,
+        latestAlertTotal:   peers,
+        history: [{
+          time:      new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          delivered: successCount,
+          failed:    peers - successCount,
+        }],
+      },
+    });
+  }
+
+  // ─── Context value ────────────────────────────────────────────────────────
   return (
     <MessageContext.Provider value={{
       currentAlert,
@@ -249,7 +422,12 @@ export function MessageProvider({ children }) {
       deliveryStats,
       connectedDevices,
       lastAlertRecipients,
+      lastSendStatus,
+      confirmations,
+      sosEvents,
       sendAlert,
+      acknowledgeAlert,
+      sendSOS,
       dismissAlert,
     }}>
       {children}
@@ -258,8 +436,8 @@ export function MessageProvider({ children }) {
 }
 
 /**
- * useMessage — the hook every screen uses to get data and actions.
- * Must be called inside a component wrapped by <MessageProvider>.
+ * useMessage — the hook every screen calls to get state and actions.
+ * Must be inside a <MessageProvider>.
  */
 export function useMessage() {
   const ctx = useContext(MessageContext);
