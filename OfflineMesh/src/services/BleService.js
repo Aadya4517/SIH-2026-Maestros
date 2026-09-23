@@ -1,414 +1,758 @@
 /**
  * BleService.js
  *
- * This is the complete BLE layer for OfflineMesh. Every phone runs this
- * exact code, which means every phone does two things simultaneously:
+ * BLE mesh networking layer.
  *
- *   PERIPHERAL role (native Kotlin module — BlePeripheralModule.kt):
- *     → Opens a GATT server with our custom service UUID
- *     → Advertises so other phones can discover us
- *     → Receives characteristic writes from central phones
- *     → Fires a "OfflineMeshMessage" event back to JS when data arrives
+ * Architecture:
+ *  - Each phone acts as BOTH:
+ *      1. BLE peripheral: advertises our custom GATT service
+ *      2. BLE central: scans and connects to other phones
  *
- *   CENTRAL role (react-native-ble-plx — this JS file):
- *     → Scans for other phones advertising our service UUID
- *     → Connects to them
- *     → Writes messages to their characteristics (this is how we send)
+ *  - The native BlePeripheral module handles:
+ *      - GATT server
+ *      - BLE advertising
+ *      - Receiving characteristic writes
  *
- * Both roles run together. That dual role is what makes it a mesh —
- * every node can both receive (peripheral) and send (central).
- *
- * IMPORTANT: Do not remove the peripheral calls. Without advertising,
- * other phones can't find us. Without the GATT server, we can't receive.
+ *  - react-native-ble-plx handles:
+ *      - BLE scanning
+ *      - Connecting to peers
+ *      - Writing alerts to connected peers
  */
 
-import { BleManager, State }          from 'react-native-ble-plx';
-import { Platform, PermissionsAndroid, NativeModules, NativeEventEmitter }
-                                       from 'react-native';
-import { Buffer }                      from 'buffer';
+import {
+  BleManager,
+  State,
+} from 'react-native-ble-plx';
 
-// ─── UUIDs — must match BlePeripheralModule.kt exactly ────────────────────────
-// Change these in both places if you ever need to update them.
-export const SERVICE_UUID = '12345678-1234-1234-1234-123456789abc';
-export const CHAR_UUID    = '87654321-4321-4321-4321-cba987654321';
+import {
+  Platform,
+  PermissionsAndroid,
+  NativeModules,
+  NativeEventEmitter,
+} from 'react-native';
 
-// ─── Native peripheral module ─────────────────────────────────────────────────
-// This is the Kotlin module in android/app/src/main/java/com/offlinemesh/
-// It handles advertising and the GATT server — the "receive" half of the mesh.
-const BlePeripheral = NativeModules.BlePeripheral;
+import { Buffer } from 'buffer';
 
-// We use NativeEventEmitter to listen for the "OfflineMeshMessage" event that
-// the Kotlin module fires whenever another phone writes to our characteristic.
-const peripheralEmitter = BlePeripheral
+// ─── Native BLE peripheral module ────────────────────────────────────────────
+
+const { BlePeripheral } = NativeModules;
+
+const blePeripheralEmitter = BlePeripheral
   ? new NativeEventEmitter(BlePeripheral)
   : null;
 
-// ─── Central-side BLE manager (react-native-ble-plx) ─────────────────────────
-// One instance only — multiple BleManagers cause crashes.
+const MESSAGE_EVENT = 'OfflineMeshMessage';
+
+// ─── Project-wide UUIDs ──────────────────────────────────────────────────────
+
+export const SERVICE_UUID =
+  '12345678-1234-1234-1234-123456789abc';
+
+export const CHAR_UUID =
+  '87654321-4321-4321-4321-cba987654321';
+
+// ─── Singleton BLE manager ───────────────────────────────────────────────────
+
 const bleManager = new BleManager();
 
-// ─── Connection pool ──────────────────────────────────────────────────────────
-// Maps deviceId → connected Device object.
-// When we broadcast, we write to every entry in this map.
-const peerConnections = new Map();
-
-// Guard set — prevents two concurrent connection attempts to the same device.
-// Without this, rapid scan callbacks can trigger duplicate connects.
-const connectingDevices = new Set();
-
-// ─── Registered callbacks ─────────────────────────────────────────────────────
-let _onMessageReceived = null; // (parsedMessage) => void
-let _onPeerListChanged  = null; // (peerCount)     => void
-
-// Subscription handle for the native peripheral event listener
-let _peripheralMessageSub = null;
-
-// ─── Android permissions ──────────────────────────────────────────────────────
+// ─── Connected peers ─────────────────────────────────────────────────────────
 
 /**
- * requestAndroidPermissions
+ * Map<deviceId, Device>
  *
- * Android changed BLE permissions in API 31 (Android 12). Before that,
- * you needed location permission to scan. After that, dedicated BLE
- * permissions were added. We handle both cases so one APK works across
- * Android 8 through 14.
+ * These are peers that THIS phone has connected to as a BLE central.
+ */
+const peerConnections = new Map();
+const connectingDevices = new Set();
+
+// Application-level BLE framing.
+// Header:
+//   bytes 0..1 = "OM"
+//   bytes 2..5 = message ID
+//   byte 6     = total chunks
+//   byte 7     = chunk index
+const MESH_FRAME_HEADER_SIZE = 8;
+
+let meshMessageSequence = 1;
+
+// ─── Callbacks ────────────────────────────────────────────────────────────────
+
+let _onMessageReceived = null;
+let _onPeerListChanged = null;
+
+// Native event subscription for incoming messages
+let _messageSubscription = null;
+
+// ─── Permission helpers ───────────────────────────────────────────────────────
+
+/**
+ * Android 12+:
+ *   BLUETOOTH_SCAN
+ *   BLUETOOTH_CONNECT
+ *   BLUETOOTH_ADVERTISE
+ *
+ * Android 6-11:
+ *   ACCESS_FINE_LOCATION
  */
 export async function requestAndroidPermissions() {
-  if (Platform.OS !== 'android') return true;
+  if (Platform.OS !== 'android') {
+    return true;
+  }
 
   const apiLevel = Platform.Version;
 
   if (apiLevel >= 31) {
-    // Android 12+ — needs the new BLE-specific permissions
     const results = await PermissionsAndroid.requestMultiple([
       PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
       PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
       PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
     ]);
+
+    const scanGranted =
+      results[
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN
+      ] === PermissionsAndroid.RESULTS.GRANTED;
+
+    const connectGranted =
+      results[
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT
+      ] === PermissionsAndroid.RESULTS.GRANTED;
+
+    const advertiseGranted =
+      results[
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE
+      ] === PermissionsAndroid.RESULTS.GRANTED;
+
+    console.log('[BLE] Permissions:', {
+      scanGranted,
+      connectGranted,
+      advertiseGranted,
+    });
+
     return (
-      results[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN]    === 'granted' &&
-      results[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === 'granted'
+      scanGranted &&
+      connectGranted &&
+      advertiseGranted
     );
-  } else {
-    // Android 6–11 — location permission enables BLE scanning
-    const result = await PermissionsAndroid.request(
-      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-    );
-    return result === 'granted';
   }
+
+  const result = await PermissionsAndroid.request(
+    PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+  );
+
+  return result === PermissionsAndroid.RESULTS.GRANTED;
 }
 
-// ─── Bluetooth state ──────────────────────────────────────────────────────────
+// ─── BLE state watcher ───────────────────────────────────────────────────────
 
-/**
- * waitForBluetooth
- *
- * Resolves as soon as the Bluetooth adapter is powered on.
- * Times out after 10 seconds with a clear error message.
- */
 export function waitForBluetooth() {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error('Bluetooth did not turn on within 10 seconds. Is Bluetooth enabled?')),
-      10000,
+    const timeout = setTimeout(() => {
+      reject(new Error('BLE timeout'));
+    }, 10000);
+
+    const subscription = bleManager.onStateChange(
+      state => {
+        console.log('[BLE] Bluetooth state:', state);
+
+        if (state === State.PoweredOn) {
+          clearTimeout(timeout);
+          subscription.remove();
+          resolve(state);
+        }
+      },
+      true,
     );
-    const sub = bleManager.onStateChange(state => {
-      if (state === State.PoweredOn) {
-        clearTimeout(timeout);
-        sub.remove();
-        resolve(state);
-      }
-    }, true); // true = emit current state immediately so we don't miss it
   });
 }
 
-// ─── Peripheral (advertising + GATT server) ───────────────────────────────────
+// ─── Native peripheral / advertising ─────────────────────────────────────────
 
 /**
- * startPeripheral
+ * Starts the native GATT server and BLE advertiser.
  *
- * Calls the native Kotlin module to:
- *   1. Open a GATT server
- *   2. Add our custom service + writable characteristic
- *   3. Start BLE advertising so other phones can find us
- *
- * This is what makes this phone discoverable. Without it, other phones
- * running OfflineMesh cannot see us and cannot send us alerts.
- *
- * The Kotlin module emits "OfflineMeshMessage" events whenever a central
- * writes to our characteristic — that's how we receive messages.
+ * Every phone should call this when the app starts.
  */
-export function startPeripheral(onMessage) {
+export async function startPeripheral() {
   if (!BlePeripheral) {
-    console.warn('[BLE] BlePeripheral native module not found — peripheral mode unavailable');
+    console.warn(
+      '[BLE] BlePeripheral native module is not available',
+    );
+
+    return false;
+  }
+
+  try {
+    BlePeripheral.startAdvertising();
+
+    console.log(
+      '[BLE] Peripheral advertising requested',
+    );
+
+    return true;
+  } catch (error) {
+    console.warn(
+      '[BLE] Failed to start peripheral:',
+      error?.message,
+    );
+
+    return false;
+  }
+}
+
+/**
+ * Stops the native GATT server and advertiser.
+ */
+export function stopPeripheral() {
+  if (!BlePeripheral) {
     return;
   }
 
-  // Subscribe to incoming write events from the native GATT server.
-  // This fires when another phone (acting as central) writes an alert
-  // to our characteristic — i.e., when someone sends us an alert.
-  if (peripheralEmitter && !_peripheralMessageSub) {
-    _peripheralMessageSub = peripheralEmitter.addListener(
-      'OfflineMeshMessage',
-      (event) => {
-        // event = { deviceId: string, data: string (base64) }
-        if (!event?.data) return;
-        try {
-          const json    = Buffer.from(event.data, 'base64').toString('utf8');
-          const message = JSON.parse(json);
-          console.log('[BLE Peripheral] Message received from', event.deviceId);
-          if (onMessage) onMessage(message);
-        } catch (e) {
-          console.warn('[BLE Peripheral] Failed to parse incoming message:', e.message);
-        }
-      },
+  try {
+    BlePeripheral.stopAdvertising();
+
+    console.log(
+      '[BLE] Peripheral advertising stopped',
+    );
+  } catch (error) {
+    console.warn(
+      '[BLE] Failed to stop peripheral:',
+      error?.message,
     );
   }
-
-  // Tell the Kotlin module to start advertising and open the GATT server
-  BlePeripheral.startAdvertising();
-  console.log('[BLE] Peripheral started — advertising our service UUID');
 }
 
-/**
- * stopPeripheral
- *
- * Stops advertising and closes the GATT server.
- * Called on app close / MessageContext cleanup.
- */
-export function stopPeripheral() {
-  if (_peripheralMessageSub) {
-    _peripheralMessageSub.remove();
-    _peripheralMessageSub = null;
-  }
-  if (BlePeripheral) {
-    BlePeripheral.stopAdvertising();
-    console.log('[BLE] Peripheral stopped');
-  }
-}
-
-// ─── Scanning (central role) ──────────────────────────────────────────────────
+// ─── Scanning ────────────────────────────────────────────────────────────────
 
 /**
- * scanForDevices
+ * Starts scanning for phones advertising our SERVICE_UUID.
  *
- * Starts a BLE scan filtered to SERVICE_UUID so we only see other
- * OfflineMesh phones. When one is found, we connect to it automatically.
- * This is the "auto-pair" feature — no QR codes, no manual pairing.
- *
- * @param {function} onPeerConnected  optional — fired when a new peer connects
+ * When a phone is found, automatically connects to it.
  */
 export async function scanForDevices(onPeerConnected) {
-  stopScan(); // clear any old scan first
+  stopScan();
 
-  console.log('[BLE] Starting scan for peers advertising:', SERVICE_UUID);
+  console.log(
+    '[BLE] Starting scan for service:',
+    SERVICE_UUID,
+  );
 
   bleManager.startDeviceScan(
     [SERVICE_UUID],
-    { allowDuplicates: false },
+    {
+      allowDuplicates: false,
+    },
     (error, device) => {
       if (error) {
-        console.warn('[BLE] Scan error:', error.message);
+        console.warn(
+          '[BLE] Scan error:',
+          error.message,
+        );
+
         return;
       }
-      if (!device) return;
 
-      // Skip devices we're already connected to or currently connecting to
-      if (peerConnections.has(device.id) || connectingDevices.has(device.id)) return;
+      if (!device) {
+        return;
+      }
 
-      console.log('[BLE] Found peer:', device.id, device.name);
-      _connectToDevice(device, onPeerConnected);
+      if (peerConnections.has(device.id)) {
+        return;
+      }
+
+      if (connectingDevices.has(device.id)) {
+        return;
+      }
+
+      console.log(
+        '[BLE] Found peer:',
+        device.id,
+        device.name,
+      );
+
+      connectingDevices.add(device.id);
+
+      connectToDevice(
+        device,
+        onPeerConnected,
+      );
     },
   );
 }
 
-/** Stop scanning — call once all expected peers are connected to save battery */
 export function stopScan() {
   bleManager.stopDeviceScan();
 }
 
-// ─── Connecting to a peer ─────────────────────────────────────────────────────
+// ─── Connecting ─────────────────────────────────────────────────────────────
 
-/**
- * _connectToDevice
- *
- * Internal. Called by scanForDevices when a new peer is spotted.
- * "Discover services and characteristics" is the BLE handshake —
- * we learn what the peer supports before we can write to it.
- *
- * The connection is stored in peerConnections so broadcastAlert can use it.
- * Self-healing: if the connection drops, we retry after 2 seconds.
- */
-async function _connectToDevice(device, onPeerConnected) {
-  // Duplicate-connect guard
-  if (connectingDevices.has(device.id)) return;
-  connectingDevices.add(device.id);
-
+async function connectToDevice(
+  device,
+  onPeerConnected,
+) {
   try {
-    const connected  = await device.connect({ autoConnect: false });
-    const discovered = await connected.discoverAllServicesAndCharacteristics();
+    console.log(
+      '[BLE] Connecting to:',
+      device.id,
+    );
 
-    peerConnections.set(device.id, discovered);
-    connectingDevices.delete(device.id);
-
-    console.log('[BLE] ✓ Connected to peer:', device.id);
-    if (_onPeerListChanged) _onPeerListChanged(peerConnections.size);
-    if (onPeerConnected)    onPeerConnected(device.id, device.name ?? device.id);
-
-    // If the connection drops, clean up and try to reconnect after a short pause
-    device.onDisconnected((_, disconnectedDevice) => {
-      const id = disconnectedDevice?.id ?? device.id;
-      console.warn('[BLE] Peer disconnected:', id);
-      peerConnections.delete(id);
-      connectingDevices.delete(id);
-      if (_onPeerListChanged) _onPeerListChanged(peerConnections.size);
-
-      // Self-healing reconnect — gives the peer time to stabilise
-      setTimeout(() => {
-        if (!peerConnections.has(device.id)) {
-          _connectToDevice(device, onPeerConnected);
-        }
-      }, 2000);
+    const connected = await device.connect({
+      autoConnect: false,
     });
 
-  } catch (e) {
-    console.warn('[BLE] Connection failed for', device.id, ':', e.message);
-    peerConnections.delete(device.id);
+    // Request a larger MTU.
+    let mtuDevice = connected;
+
+    try {
+      mtuDevice = await connected.requestMTU(512);
+
+      console.log(
+        '[BLE] Negotiated MTU:',
+        mtuDevice.mtu,
+        'with peer:',
+        device.id,
+      );
+    } catch (mtuError) {
+      console.warn(
+        '[BLE] MTU request failed for',
+        device.id,
+        ':',
+        mtuError?.message,
+      );
+    }
+
+    const discovered =
+      await mtuDevice.discoverAllServicesAndCharacteristics();
+
+    peerConnections.set(
+      device.id,
+      discovered,
+    );
+
     connectingDevices.delete(device.id);
+
+    console.log(
+      '[BLE] Connected to peer:',
+      device.id,
+      'MTU:',
+      discovered.mtu,
+    );
+
+    if (_onPeerListChanged) {
+      _onPeerListChanged(
+        peerConnections.size,
+      );
+    }
+
+    if (onPeerConnected) {
+      onPeerConnected(
+        device.id,
+        device.name,
+      );
+    }
+
+    // Handle disconnection
+    device.onDisconnected(
+      (err, disconnectedDevice) => {
+        const disconnectedId =
+          disconnectedDevice?.id || device.id;
+
+        console.warn(
+          '[BLE] Peer disconnected:',
+          disconnectedId,
+        );
+
+        peerConnections.delete(
+          disconnectedId,
+        );
+
+        if (_onPeerListChanged) {
+          _onPeerListChanged(
+            peerConnections.size,
+          );
+        }
+
+        // Attempt reconnection after 2 seconds.
+        setTimeout(() => {
+          if (
+            !peerConnections.has(
+              device.id,
+            ) &&
+            !connectingDevices.has(
+              device.id,
+            )
+          ) {
+            connectingDevices.add(
+              device.id,
+            );
+
+            connectToDevice(
+              device,
+              onPeerConnected,
+            );
+          }
+        }, 2000);
+      },
+    );
+
+  } catch (error) {
+    console.warn(
+      '[BLE] Connection failed for',
+      device.id,
+      ':',
+      error?.message,
+    );
+
+    peerConnections.delete(
+      device.id,
+    );
+
+    connectingDevices.delete(
+      device.id,
+    );
   }
 }
 
-// ─── Broadcasting an alert ────────────────────────────────────────────────────
+// ─── Broadcasting ────────────────────────────────────────────────────────────
 
 /**
- * broadcastAlert
+ * Sends the alert to every connected peer.
  *
- * Sends the alert message to every connected peer by writing to their
- * GATT characteristic. We use Promise.allSettled so a failure on one
- * peer doesn't block delivery to the others.
- *
- * The message is JSON-encoded then base64-wrapped because BLE
- * characteristics transfer raw bytes, not strings.
- *
- * @param  {object} message  the full alert object from MessageService
- * @return {object}          map of { deviceId -> true/false }
+ * Large JSON payloads are split into MTU-safe application-level frames.
+ * This avoids Android prepared/reliable writes.
  */
 export async function broadcastAlert(message) {
-  const json    = JSON.stringify(message);
-  const base64  = Buffer.from(json, 'utf8').toString('base64');
+  const json = JSON.stringify(message);
+
+  const payload = Buffer.from(
+    json,
+    'utf8',
+  );
+
   const results = {};
-  const peers   = Array.from(peerConnections.entries());
+
+  const peers = Array.from(
+    peerConnections.entries(),
+  );
 
   if (peers.length === 0) {
-    console.warn('[BLE] No peers connected — alert cannot be broadcast');
+    console.warn(
+      '[BLE] No peers connected — cannot broadcast',
+    );
+
     return results;
   }
 
-  console.log('[BLE] Broadcasting to', peers.length, 'peer(s):', message.type);
+  const messageId =
+    meshMessageSequence++ >>> 0;
+
+  console.log(
+    '[BLE] Broadcasting to',
+    peers.length,
+    'peer(s); JSON bytes:',
+    payload.length,
+    'messageId:',
+    messageId,
+  );
 
   await Promise.allSettled(
-    peers.map(async ([deviceId, device]) => {
-      try {
-        await device.writeCharacteristicWithResponseForService(
-          SERVICE_UUID,
-          CHAR_UUID,
-          base64,
-        );
-        results[deviceId] = true;
-        console.log('[BLE] ✓ Delivered to', deviceId);
-      } catch (e) {
-        console.warn('[BLE] ✗ Failed to deliver to', deviceId, ':', e.message);
-        results[deviceId] = false;
-        // Drop the broken connection — it will auto-reconnect
-        peerConnections.delete(deviceId);
-        connectingDevices.delete(deviceId);
-        if (_onPeerListChanged) _onPeerListChanged(peerConnections.size);
-      }
-    }),
+    peers.map(
+      async ([deviceId, device]) => {
+        try {
+          /*
+           * BLE ATT payload = MTU - 3 bytes.
+           *
+           * Each frame has an 8-byte application header,
+           * therefore only the remaining space is used for
+           * JSON payload data.
+           */
+
+          const mtu =
+            Number(device?.mtu) || 23;
+
+          const maxAttPayload =
+            Math.max(
+              20,
+              mtu - 3,
+            );
+
+          const chunkPayloadSize =
+            Math.max(
+              1,
+              maxAttPayload -
+                MESH_FRAME_HEADER_SIZE,
+            );
+
+          const totalChunks =
+            Math.ceil(
+              payload.length /
+                chunkPayloadSize,
+            );
+
+          if (totalChunks > 255) {
+            throw new Error(
+              `Alert too large: ${totalChunks} chunks`,
+            );
+          }
+
+          console.log(
+            '[BLE] Sending to',
+            deviceId,
+            'MTU:',
+            mtu,
+            'chunk payload:',
+            chunkPayloadSize,
+            'chunks:',
+            totalChunks,
+          );
+
+          for (
+            let index = 0;
+            index < totalChunks;
+            index += 1
+          ) {
+            const start =
+              index *
+              chunkPayloadSize;
+
+            const end =
+              Math.min(
+                start +
+                  chunkPayloadSize,
+                payload.length,
+              );
+
+            const chunk =
+              payload.slice(
+                start,
+                end,
+              );
+
+            /*
+             * Frame layout:
+             *
+             * 0   = 0x4F ('O')
+             * 1   = 0x4D ('M')
+             * 2-5 = message ID
+             * 6   = total chunks
+             * 7   = chunk index
+             * 8+  = JSON payload
+             */
+
+            const frame =
+              Buffer.alloc(
+                MESH_FRAME_HEADER_SIZE +
+                  chunk.length,
+              );
+
+            frame[0] = 0x4f;
+            frame[1] = 0x4d;
+
+            frame.writeUInt32BE(
+              messageId,
+              2,
+            );
+
+            frame[6] =
+              totalChunks;
+
+            frame[7] =
+              index;
+
+            chunk.copy(
+              frame,
+              MESH_FRAME_HEADER_SIZE,
+            );
+
+            /*
+             * Each frame is below the ATT payload limit,
+             * so this is a normal GATT write.
+             */
+            await device.writeCharacteristicWithResponseForService(
+              SERVICE_UUID,
+              CHAR_UUID,
+              frame.toString('base64'),
+            );
+          }
+
+          results[deviceId] = true;
+
+          console.log(
+            '[BLE] Delivered to',
+            deviceId,
+            'in',
+            totalChunks,
+            'chunk(s)',
+          );
+
+        } catch (error) {
+
+          console.warn(
+            '[BLE] Failed to deliver to',
+            deviceId,
+            ':',
+            error?.message,
+          );
+
+          results[deviceId] = false;
+
+          peerConnections.delete(
+            deviceId,
+          );
+
+          if (_onPeerListChanged) {
+            _onPeerListChanged(
+              peerConnections.size,
+            );
+          }
+        }
+      },
+    ),
   );
 
   return results;
 }
 
-// ─── Listening for messages (central side) ────────────────────────────────────
+// ─── Receiving messages ──────────────────────────────────────────────────────
 
 /**
- * listenForMessages
+ * Incoming messages are received by the native Android GATT server.
  *
- * Sets up monitoring on already-connected peers via react-native-ble-plx.
- * This catches messages sent from peers who are acting as centrals and
- * writing to our characteristic via the ble-plx write method.
+ * Flow:
  *
- * NOTE: Messages sent from peers whose peripheral is the Kotlin GATT server
- * arrive via the NativeEventEmitter in startPeripheral() instead.
- * Both paths feed into the same onMessage callback.
+ * Phone A
+ *    |
+ *    | BLE characteristic write
+ *    v
+ * Phone B native GATT server
+ *    |
+ *    | onCharacteristicWriteRequest()
+ *    v
+ * NativeEventEmitter
+ *    |
+ *    v
+ * JavaScript
  *
- * @param {function} onMessage  (parsedMessageObject) => void
+ * Native module event:
+ *
+ * OfflineMeshMessage
+ *
+ * {
+ *   deviceId: "...",
+ *   data: "base64..."
+ * }
  */
 export function listenForMessages(onMessage) {
-  _onMessageReceived = onMessage;
+  _onMessageReceived =
+    onMessage;
 
-  // Monitor existing connections
-  peerConnections.forEach((device, deviceId) => {
-    _monitorPeer(device, deviceId, onMessage);
-  });
-}
+  // Remove existing listener.
+  if (_messageSubscription) {
+    _messageSubscription.remove();
+    _messageSubscription = null;
+  }
 
-function _monitorPeer(device, deviceId, onMessage) {
-  device.monitorCharacteristicForService(
-    SERVICE_UUID,
-    CHAR_UUID,
-    (error, characteristic) => {
-      if (error) {
-        console.warn('[BLE] Monitor error on', deviceId, ':', error.message);
-        return;
-      }
-      if (!characteristic?.value) return;
+  if (!blePeripheralEmitter) {
+    console.warn(
+      '[BLE] Native BLE peripheral emitter unavailable',
+    );
 
-      try {
-        const json    = Buffer.from(characteristic.value, 'base64').toString('utf8');
-        const message = JSON.parse(json);
-        console.log('[BLE Central] Message received from', deviceId);
-        if (onMessage) onMessage(message);
-      } catch (e) {
-        console.warn('[BLE] Could not parse message from', deviceId, ':', e.message);
-      }
-    },
+    return;
+  }
+
+  _messageSubscription =
+    blePeripheralEmitter.addListener(
+      MESSAGE_EVENT,
+      event => {
+        try {
+          if (!event?.data) {
+            return;
+          }
+
+          const json =
+            Buffer
+              .from(
+                event.data,
+                'base64',
+              )
+              .toString('utf8');
+
+          const message =
+            JSON.parse(json);
+
+          console.log(
+            '[BLE] Received message from',
+            event.deviceId,
+            ':',
+            message,
+          );
+
+          if (_onMessageReceived) {
+            _onMessageReceived(
+              message,
+            );
+          }
+
+        } catch (error) {
+
+          console.warn(
+            '[BLE] Failed to parse incoming message:',
+            error?.message,
+          );
+        }
+      },
+    );
+
+  console.log(
+    '[BLE] Listening for native BLE messages',
   );
 }
 
-// ─── Peer utilities ───────────────────────────────────────────────────────────
+// ─── Peer information ────────────────────────────────────────────────────────
 
-/** Number of currently connected peers */
 export function getPeerCount() {
   return peerConnections.size;
 }
 
-/** Array of all connected device IDs */
 export function getPeerIds() {
-  return Array.from(peerConnections.keys());
+  return Array.from(
+    peerConnections.keys(),
+  );
 }
 
-/** Register a callback to be notified when peer count changes */
-export function onPeerListChanged(callback) {
-  _onPeerListChanged = callback;
+export function onPeerListChanged(
+  callback,
+) {
+  _onPeerListChanged =
+    callback;
 }
 
-// ─── Shutdown ─────────────────────────────────────────────────────────────────
+// ─── Cleanup ─────────────────────────────────────────────────────────────────
 
-/**
- * destroyBleManager
- *
- * Graceful cleanup — called when the app closes or MessageContext unmounts.
- * Stops the scan, disconnects all peers, then destroys the BLE manager.
- * Does NOT call stopPeripheral — MessageContext handles that separately.
- */
 export function destroyBleManager() {
   stopScan();
-  peerConnections.forEach(device => {
-    try { device.cancelConnection(); } catch (_) {}
-  });
+
+  if (_messageSubscription) {
+    _messageSubscription.remove();
+    _messageSubscription = null;
+  }
+
+  stopPeripheral();
+
+  peerConnections.forEach(
+    device => {
+      try {
+        device.cancelConnection();
+      } catch (_) {}
+    },
+  );
+
   peerConnections.clear();
   connectingDevices.clear();
+
+  _onMessageReceived = null;
+  _onPeerListChanged = null;
+
   bleManager.destroy();
 }
